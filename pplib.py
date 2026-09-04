@@ -1722,19 +1722,37 @@ def wavelet_smooth(port, wavelet='db8', nlevel=5, threshtype='hard', fact=1.0):
         # Translation-invariant (stationary) wavelet transform/denoising
         coeffs = np.array(pw.swt(prof, wavelet, level=nlevel, start_level=0,
                                  axis=-1))
-        # Get threshold value
-        lopt = fact * (np.median(np.abs(coeffs[0])) / 0.6745) * np.sqrt(2 * \
-                                                                        np.log(nbin))
-        # Do wavelet thresholding
-        coeffs = pw.threshold(coeffs, lopt, mode=threshtype, substitute=0.0)
-        # Reconstruct data
-        smooth_port[ichan] = pw.iswt(list(map(tuple, coeffs)), wavelet)
+        smooth_port[ichan] = _wavelet_denoise_from_swt(coeffs, wavelet, nbin,
+                                                        threshtype, fact)
 
     # Return smoothed portrait
     if one_prof:
         return smooth_port[0]
     else:
         return smooth_port
+
+
+def _wavelet_denoise_from_swt(coeffs, wavelet, nbin, threshtype, fact):
+    """
+    Threshold precomputed SWT coefficients and reconstruct the profile.
+
+    Factored out of wavelet_smooth(...) so that smart_smooth(...) can reuse
+        a single SWT decomposition across many trial values of fact/nlevel
+        instead of recomputing pw.swt(...) (the expensive step) on every
+        trial; see smart_smooth(...).
+
+    coeffs is the nlevel x 2 x nbin array of SWT (cA, cD) coefficient pairs
+        for a single profile, e.g. from pw.swt(prof, wavelet, level=nlevel,
+        start_level=0, axis=-1).
+    wavelet, nbin, threshtype, fact are as in wavelet_smooth(...).
+    """
+    # Get threshold value
+    lopt = fact * (np.median(np.abs(coeffs[0])) / 0.6745) * np.sqrt(2 * \
+                                                                    np.log(nbin))
+    # Do wavelet thresholding
+    coeffs = pw.threshold(coeffs, lopt, mode=threshtype, substitute=0.0)
+    # Reconstruct data
+    return pw.iswt(list(map(tuple, coeffs)), wavelet)
 
 
 def smart_smooth(port, try_nlevels=None, rchi2_tol=0.1, **kwargs):
@@ -1784,17 +1802,24 @@ def smart_smooth(port, try_nlevels=None, rchi2_tol=0.1, **kwargs):
     if 'fact' in kwargs: kwargs.pop('fact')
     for iprof, prof in enumerate(port):
         if not np.any(prof): continue
+        # Compute the SWT decomposition once, at the deepest level that
+        # will be tried; pw.swt(prof, wavelet, level=L) computes levels
+        # 1..L as a cascade, so full_coeffs[try_nlevels-nlevel:] is exactly
+        # the (nlevel x 2 x nbin) array pw.swt(prof, wavelet, level=nlevel)
+        # would have returned on its own, without recomputing it.  Since
+        # fact does not affect the decomposition (only the thresholding
+        # that follows it), this avoids redoing the expensive SWT/ISWT
+        # transform on every one of the Ns grid points below, for every
+        # candidate level.
+        full_coeffs = np.array(pw.swt(prof, wavelet, level=try_nlevels,
+                                      start_level=0, axis=-1))
         fun_vals = np.zeros([try_nlevels])
         fact_mins = np.zeros([try_nlevels])
         for ilevel in range(try_nlevels):
-            options = {'maxiter': 1000, 'disp': False}  # , xatol:1e-8}
-            other_args = (prof, wavelet, ilevel + 1, threshtype, rchi2_tol)
-            # results = opt.minimize_scalar(fit_wavelet_smooth_function,
-            #        bounds=[0.0,3.0], args=other_args, method='bounded',
-            #        options=options)
-            # fact_mins[ilevel] = results.x
-            # fun_vals[ilevel] = results.fun
-            results = opt.brute(fit_wavelet_smooth_function,
+            nlevel = ilevel + 1
+            coeffs = full_coeffs[try_nlevels - nlevel:]
+            other_args = (coeffs, wavelet, nbin, threshtype, rchi2_tol, prof)
+            results = opt.brute(_fit_wavelet_smooth_function_from_swt,
                                 ranges=[tuple((0.0, 3.0))], args=other_args, Ns=30,
                                 full_output=True)
             fact_mins[ilevel] = results[0][0]
@@ -1822,6 +1847,32 @@ def fit_wavelet_smooth_function(fact, prof, wavelet, nlevel, threshtype,
     """
     smooth_prof = wavelet_smooth(prof, wavelet=wavelet, nlevel=nlevel,
                                  threshtype=threshtype, fact=fact)
+    return _wavelet_smooth_pseudo_snr(smooth_prof, prof, rchi2_tol)
+
+
+def _fit_wavelet_smooth_function_from_swt(fact, coeffs, wavelet, nbin,
+                                          threshtype, rchi2_tol, prof):
+    """
+    Same objective as fit_wavelet_smooth_function(...), but reconstructs the
+        trial profile from a precomputed SWT decomposition (coeffs) instead
+        of recomputing pw.swt(...) for every fact trial; used by
+        smart_smooth(...) -- see _wavelet_denoise_from_swt(...).
+    """
+    smooth_prof = _wavelet_denoise_from_swt(coeffs, wavelet, nbin,
+                                            threshtype, fact)
+    return _wavelet_smooth_pseudo_snr(smooth_prof, prof, rchi2_tol)
+
+
+def _wavelet_smooth_pseudo_snr(smooth_prof, prof, rchi2_tol):
+    """
+    Calculate a pseudo-S/N value of smooth_prof for smart_smooth(...).
+
+    Returns the negative pseudo-S/N estimate (for minimization), or 0 if the
+        reduced chi-squared between prof and smooth_prof deviates from 1.0
+        by more than rchi2_tol.
+
+    See smart_smooth(...) and wavelet_smooth(...) for arguments.
+    """
     smooth_prof_signal = np.sum(np.abs(np.fft.rfft(smooth_prof)[1:]) ** 2)
     if smooth_prof_signal:
         smooth_prof_noise = get_noise(smooth_prof) * \
