@@ -28,6 +28,106 @@ from past.utils import old_div
 from pplib import *
 
 
+def _fit_pca_and_smooth(port, freqs, pca_weights, max_ncomp, smooth,
+                        snr_cutoff, rchi2_tol, wavelet, quiet=False, **kwargs):
+    """
+    Do PCA on port and (optionally) wavelet-smooth the mean profile and the
+        significant eigenprofiles.
+
+    Returns (mean_prof, eigval, eigvec, ieig, ncomp, smooth_mean_prof,
+        smooth_eigvec); smooth_mean_prof and smooth_eigvec are None if
+        smooth is False.
+
+    port is an nchan x nbin array of data values.
+    freqs is an nchan array of the frequencies corresponding to port; it is
+        unused here but accepted for a uniform call signature with
+        _fit_spline_curve(...).
+    pca_weights are the nchan weights used in pca(...).
+    max_ncomp, smooth, snr_cutoff, rchi2_tol, and **kwargs are as in
+        make_spline_model(...); smooth=True requires pywt.
+    wavelet is the name of the mother wavelet passed to smart_smooth(...)
+        (and on to wavelet_smooth(...)) for both the mean profile and the
+        eigenprofiles.
+    quiet=True suppresses output.
+    """
+    mean_prof = old_div((port.T * pca_weights).T.sum(axis=0), pca_weights.sum())
+    eigval, eigvec = pca(port, mean_prof, pca_weights, quiet=quiet)
+    if max_ncomp is None:
+        return_max = 10
+    else:
+        return_max = min(max_ncomp, 10)
+    smooth_mean_prof = smooth_eigvec = None
+    if smooth:
+        if 'pywt' not in sys.modules:
+            raise ImportError("You failed to import pywt and need PyWavelets to use smooth=True!")
+        ieig, smooth_eigvec = find_significant_eigvec(eigvec, check_max=10,
+                                                       return_max=return_max, snr_cutoff=snr_cutoff,
+                                                       return_smooth=True, rchi2_tol=rchi2_tol,
+                                                       wavelet=wavelet, **kwargs)
+        smooth_mean_prof = smart_smooth(mean_prof, rchi2_tol=rchi2_tol,
+                                        wavelet=wavelet)
+    else:
+        ieig = find_significant_eigvec(eigvec, check_max=10,
+                                       return_max=return_max, snr_cutoff=snr_cutoff,
+                                       return_smooth=False, rchi2_tol=rchi2_tol,
+                                       wavelet=wavelet, **kwargs)
+    ncomp = len(ieig)
+    return (mean_prof, eigval, eigvec, ieig, ncomp, smooth_mean_prof,
+            smooth_eigvec)
+
+
+def _fit_spline_curve(proj_port, freqs, spl_weights, noise_stds, k, sfac,
+                      max_nbreak, bw, quiet=False):
+    """
+    Fit a B-spline curve, parameterized by freqs, to proj_port.
+
+    Returns (tck, u, fp, ier, msg); see si.splprep(...) for details.  Returns
+        ([np.array([]), np.array([]), 0], np.array([]), None, None, None) if
+        proj_port has no columns (i.e. ncomp == 0).
+
+    proj_port is an nchan x ncomp array of projections of profiles onto
+        ncomp basis eigenvectors.
+    freqs is the nchan array of frequencies corresponding to proj_port,
+        increasing or decreasing monotonically with bw's sign.
+    spl_weights are the nchan weights passed to si.splprep(...) as w.
+    noise_stds are the nchan noise levels used to construct the default
+        smoothing condition s (see sfac below).
+    k is the polynomial degree of the spline; see make_spline_model(...).
+    sfac is a multiplicative smoothing factor; see make_spline_model(...).
+    max_nbreak is the maximum number of breakpoints (unique knots) to allow;
+        see make_spline_model(...).
+    bw is the bandwidth of the data (its sign determines whether freqs needs
+        to be reversed for si.splprep(...), which requires u increasing).
+    quiet=True suppresses output.
+    """
+    ncomp = proj_port.shape[1]
+    if ncomp == 0:
+        return [np.array([]), np.array([]), 0], np.array([]), None, None, None
+    nu_lo, nu_hi = freqs.min(), freqs.max()
+    s = sfac * len(proj_port) * np.sum((spl_weights * noise_stds)**2) / \
+            sum(spl_weights)**2
+    if bw < 0: flip = -1   #u in si.splprep has to be increasing...
+    else: flip = 1
+    #Find the B-spline curve traced by the projected vectors,
+    #parameterized by frequency
+    (tck,u), fp, ier, msg = si.splprep(proj_port[::flip].T,
+            w=spl_weights[::flip], u=freqs[::flip], ub=nu_lo, ue=nu_hi,
+            k=k, task=0, s=s, t=None, full_output=1, nest=None, per=0,
+            quiet=int(quiet))
+    if max_nbreak is not None and len(np.unique(tck[0])) > max_nbreak:
+        if max_nbreak < 2:
+            print("max_nbreak not >= 2; setting max_nbreak = 2...")
+            max_nbreak = 2
+        if max_nbreak == 2: s = np.inf
+        (tck,u), fp, ier, msg = si.splprep(proj_port[::flip].T,
+                w=spl_weights[::flip], u=freqs[::flip], ub=nu_lo,
+                ue=nu_hi, k=k, task=0, s=s, t=None, full_output=1,
+                nest=max_nbreak+(k*2), per=0, quiet=int(quiet))
+    if ier > 1: #Will also catch when ier == "unknown"
+        print("Something went wrong in si.splprep:\n%s" % msg)
+    return tck, u, fp, ier, msg
+
+
 class DataPortrait(DataPortrait):
     """
     DataPortrait is a class that contains the data to which a model is fit.
@@ -37,8 +137,9 @@ class DataPortrait(DataPortrait):
     """
 
     def make_spline_model(self, max_ncomp=10, smooth=True, snr_cutoff=150.0,
-                          rchi2_tol=0.1, k=3, sfac=1.0, max_nbreak=None, model_name=None,
-                          quiet=False, **kwargs):
+                          rchi2_tol=0.1, k=3, sfac=1.0, max_nbreak=None,
+                          wavelet='db8', model_name=None, quiet=False,
+                          **kwargs):
         """
         Make a model based on PCA and B-spline interpolation.
 
@@ -63,6 +164,9 @@ class DataPortrait(DataPortrait):
             breakpoints, irrespective of the other smoothing condition.  The
             corresponding maximum number of B-splines will be max_nspline =
             max_nbreak + k - 1.  max_nbreak should be >= 2.
+        wavelet is the name of the mother wavelet used (via smart_smooth(...))
+            to smooth the mean profile and eigenprofiles when smooth=True; see
+            wavelet_smooth(...) for more [default='db8'].
         model_name is the name of the model; defaults to self.datafile +
             '.spl'
         quiet=True suppresses output.
@@ -72,10 +176,7 @@ class DataPortrait(DataPortrait):
         # Definitions
         port = self.portx
         pca_weights = old_div(self.SNRsxs, np.sum(self.SNRsxs))
-        mean_prof = old_div((port.T * pca_weights).T.sum(axis=0), pca_weights.sum())
         freqs = self.freqsxs[0]
-        nu_lo = freqs.min()
-        nu_hi = freqs.max()
         # Check nbin
         nbin = port.shape[1]
         if nbin % 2 != 0:
@@ -84,28 +185,12 @@ class DataPortrait(DataPortrait):
         elif np.modf(np.log2(nbin))[0] != 0.0:
             print(
                 "nbin = %d is not a power of two; can only try wavelet_smooth to one level; recommend resampling to a power-of-two number of phase bins.\n" % nbin)
-        # Do principal component analysis
-        eigval, eigvec = pca(port, mean_prof, pca_weights, quiet=quiet)
-        # Get "significant" eigenvectors
-        if max_ncomp is None:
-            return_max = 10
-        else:
-            return_max = min(max_ncomp, 10)
-        if smooth:
-            if 'pywt' not in sys.modules:
-                raise ImportError("You failed to import pywt and need PyWavelets to use smooth=True!")
-            ieig, smooth_eigvec = find_significant_eigvec(eigvec, check_max=10,
-                                                          return_max=return_max, snr_cutoff=snr_cutoff,
-                                                          return_smooth=True, rchi2_tol=rchi2_tol, **kwargs)
-        else:
-            ieig = find_significant_eigvec(eigvec, check_max=10,
-                                           return_max=return_max, snr_cutoff=snr_cutoff,
-                                           return_smooth=False, rchi2_tol=rchi2_tol, **kwargs)
-        ncomp = len(ieig)
-
-        if smooth:
-            smooth_mean_prof = smart_smooth(mean_prof,
-                                            rchi2_tol=rchi2_tol)
+        # Do principal component analysis and (optionally) smooth the mean
+        # profile and significant eigenprofiles
+        mean_prof, eigval, eigvec, ieig, ncomp, smooth_mean_prof, \
+                smooth_eigvec = _fit_pca_and_smooth(port, freqs, pca_weights,
+                        max_ncomp, smooth, snr_cutoff, rchi2_tol, wavelet,
+                        quiet=quiet, **kwargs)
 
         if ncomp == 0:  # Will make model with constant average port
             proj_port = port[:, :ncomp]
@@ -134,36 +219,10 @@ class DataPortrait(DataPortrait):
                 # Find the projections of the profiles onto the basis components
                 proj_port = np.dot(delta_port, eigvec[:, ieig])
 
-        if ncomp == 0:
-            (tck, u) = [np.array([]), np.array([]), 0], np.array([])
-            fp, ier, msg = None, None, None
-        else:
-            spl_weights = pca_weights
-            s = sfac * len(proj_port) * \
-                    np.sum((self.SNRsxs * self.noise_stdsxs)**2) / \
-                    sum(self.SNRsxs)**2
-            if self.bw < 0: flip = -1   #u in si.splprep has to be increasing...
-            else: flip = 1
-            #Find the B-spline curve traced by the projected vectors,
-            #parameterized by frequency
-            (tck,u), fp, ier, msg = si.splprep(proj_port[::flip].T,
-                    w=spl_weights[::flip], u=freqs[::flip], ub=nu_lo, ue=nu_hi,
-                    k=k, task=0, s=s, t=None, full_output=1, nest=None, per=0,
-                    quiet=int(quiet))
-
-            if max_nbreak is not None and len(np.unique(tck[0])) > max_nbreak:
-                if max_nbreak < 2:
-                    print("max_nbreak not >= 2; setting max_nbreak = 2...")
-                    max_nbreak = 2
-                if max_nbreak == 2: s = np.inf
-                (tck, u), fp, ier, msg = si.splprep(proj_port[::flip].T,
-                                                    w=spl_weights[::flip], u=freqs[::flip], ub=nu_lo,
-                                                    ue=nu_hi, k=k, task=0, s=s, t=None, full_output=1,
-                                                    nest=max_nbreak + (k * 2), per=0, quiet=int(quiet))
-
-            if ier > 1:  # Will also catch when ier == "unknown"
-                print("Something went wrong in si.splprep for %s:\n%s" % (
-                    self.source, msg))
+        spl_weights = pca_weights
+        tck, u, fp, ier, msg = _fit_spline_curve(proj_port, freqs,
+                spl_weights, self.noise_stdsxs, k, sfac, max_nbreak, self.bw,
+                quiet=quiet)
 
         # Build model
         if ncomp != 0:
@@ -287,6 +346,180 @@ class DataPortrait(DataPortrait):
                                           self.freqsxs[0], old_div(self.SNRsxs, np.sum(self.SNRsxs)),
                                           ncoord=ncomp, title=title, **kwargs)
 
+    def photoshop_spline_model(self, max_ncomp=10, snr_cutoff=150.0,
+                               rchi2_tol=0.1,
+                               wavelets=('db4', 'db8', 'db12', 'db20', 'sym8',
+                                         'sym12', 'coif4'),
+                               ks=(1, 3, 5), max_nbreak_candidates=(None,),
+                               test_frac=0.2, nrepeat=20, sfac_bounds=(-3, 2),
+                               seed=None, apply=True, model_name=None,
+                               quiet=False, **kwargs):
+        """
+        Auto-select (wavelet, k, sfac, max_nbreak) for make_spline_model(...)
+            via Monte Carlo cross-validation over frequency channels.
+
+        For each candidate wavelet, nrepeat random train/test splits of the
+            (non-edge) frequency channels are drawn.  For each split, PCA and
+            eigenprofile/mean-profile smoothing are fit on the training
+            channels only -- this is the expensive step, and is independent
+            of k, sfac, and max_nbreak, so it is done once per (wavelet,
+            split) and reused.  Then, for each (k, max_nbreak) combination,
+            sfac is optimized (on a log scale) to minimize the out-of-sample
+            reduced chi-squared of the B-spline curve evaluated on the
+            held-out channels.  The standard error of that score across the
+            nrepeat splits is used to apply a "1-SE rule": among
+            (wavelet, k, max_nbreak, sfac) combinations statistically
+            indistinguishable from the minimum-scoring one, the most
+            regularized (largest sfac, then smallest max_nbreak, then k == 3,
+            then wavelet == 'db8') is selected.
+
+        If apply=True (default), make_spline_model(...) is then called on the
+            full dataset using the selected hyperparameters, exactly as if
+            they had been supplied by hand.  self.photoshop_results holds the
+            full grid of (wavelet, k, max_nbreak, sfac, score, se) that was
+            evaluated, for inspection; self.photoshop_best holds the
+            selected entry.
+
+        max_ncomp, snr_cutoff, rchi2_tol are as in make_spline_model(...) and
+            are held fixed here (not tuned).
+        wavelets is the list of candidate mother wavelets to try.  This is a
+            curated shortlist, not pywt.wavelist()'s full set, to keep the
+            (expensive) PCA/smoothing stage's cost bounded; override for an
+            exhaustive search.
+        ks is the list of candidate spline polynomial degrees to try.
+        max_nbreak_candidates is the list of candidate max_nbreak caps to try
+            (None means unconstrained, i.e. governed only by sfac).
+        test_frac is the fraction of (non-edge) channels held out per split.
+        nrepeat is the number of random train/test splits per wavelet.
+        sfac_bounds are the (log10(sfac_min), log10(sfac_max)) search bounds
+            passed to the underlying opt.brute search over sfac.
+        seed seeds the random number generator, for reproducibility.
+        apply=True fits and stores the final model using the chosen
+            hyperparameters; apply=False only computes/stores the search
+            results without changing self's model attributes.
+        model_name is passed to make_spline_model(...) if apply=True.
+        quiet=True suppresses output.
+        **kwargs get passed to find_significant_eigvec(...) (and hence to
+            make_spline_model(...), if apply=True).
+        """
+        if 'pywt' not in sys.modules:
+            raise ImportError("You failed to import pywt and need PyWavelets to use photoshop_spline_model!")
+
+        port = self.portx
+        freqs = self.freqsxs[0]
+        SNRs = self.SNRsxs
+        noise_stds = self.noise_stdsxs
+        nchanx, nbin = port.shape
+        rng = np.random.RandomState(seed)
+
+        # Never hold out the band-edge channels -- doing so would shrink the
+        # training fit's ub/ue boundary and force gen_spline_portrait to
+        # extrapolate for that channel, confounding "bad hyperparameter" with
+        # "channel required extrapolation".
+        hold_pool = np.array([ichan for ichan in range(nchanx)
+                if ichan not in (freqs.argmin(), freqs.argmax())])
+        n_test = max(1, int(round(test_frac * len(hold_pool))))
+
+        # Expensive stage: PCA + smoothing, once per (wavelet, repeat);
+        # reused below across all (k, max_nbreak, sfac) combinations.
+        stash = {}
+        for w in wavelets:
+            if not quiet:
+                print("photoshop_spline_model: fitting %d train/test splits for wavelet '%s'..." % (nrepeat, w))
+            for r in range(nrepeat):
+                test_idx = rng.choice(hold_pool, n_test, replace=False)
+                train_idx = np.setdiff1d(np.arange(nchanx), test_idx)
+                port_train = port[train_idx]
+                freqs_train = freqs[train_idx]
+                pca_weights_train = old_div(SNRs[train_idx], np.sum(SNRs[train_idx]))
+                mean_prof, eigval, eigvec, ieig, ncomp, smooth_mean_prof, \
+                        smooth_eigvec = _fit_pca_and_smooth(port_train,
+                                freqs_train, pca_weights_train, max_ncomp,
+                                True, snr_cutoff, rchi2_tol, w, quiet=True,
+                                **kwargs)
+                stash[(w, r)] = DataBunch(
+                        proj_port_train=np.dot(port_train - mean_prof,
+                            smooth_eigvec[:, ieig]),
+                        freqs_train=freqs_train,
+                        spl_weights=pca_weights_train,
+                        noise_train=noise_stds[train_idx],
+                        smooth_mean_prof=smooth_mean_prof,
+                        smooth_eigvec=smooth_eigvec, ieig=ieig,
+                        freqs_test=freqs[test_idx], port_test=port[test_idx],
+                        noise_test=noise_stds[test_idx])
+
+        # Cheap stage: optimize sfac (log10) per (wavelet, k, max_nbreak).
+        results = []
+        for w in wavelets:
+            for k in ks:
+                for max_nbreak in max_nbreak_candidates:
+
+                    def per_repeat_scores(log10_sfac):
+                        sfac = 10.0**log10_sfac
+                        scores = np.zeros(nrepeat)
+                        for r in range(nrepeat):
+                            d = stash[(w, r)]
+                            tck, u, fp, ier, msg = _fit_spline_curve(
+                                    d.proj_port_train, d.freqs_train,
+                                    d.spl_weights, d.noise_train, k, sfac,
+                                    max_nbreak, self.bw, quiet=True)
+                            model_test = gen_spline_portrait(
+                                    d.smooth_mean_prof, d.freqs_test,
+                                    d.smooth_eigvec[:, d.ieig], tck)
+                            # dof=1 leaves the raw (unreduced) summed chi2,
+                            # so it can be normalized once below by the true
+                            # dof (nbin per held-out channel).
+                            scores[r] = old_div(get_red_chi2(d.port_test,
+                                    model_test, errs=d.noise_test, dof=1),
+                                    (nbin * len(d.port_test)))
+                        return scores
+
+                    def cv_score(log10_sfac):
+                        return per_repeat_scores(log10_sfac).mean()
+
+                    brute_result = opt.brute(cv_score, ranges=[sfac_bounds],
+                            Ns=25, full_output=True)
+                    best_log10_sfac = brute_result[0][0]
+                    scores = per_repeat_scores(best_log10_sfac)
+                    score = scores.mean()
+                    se = old_div(scores.std(ddof=1), np.sqrt(nrepeat)) \
+                            if nrepeat > 1 else 0.0
+                    results.append(DataBunch(wavelet=w, k=k,
+                            max_nbreak=max_nbreak, sfac=10.0**best_log10_sfac,
+                            score=score, se=se))
+
+        # Selection: minimum CV score, then a 1-SE-rule tie-break that
+        # prefers more strongly regularized choices among combinations
+        # statistically indistinguishable from the minimum.
+        global_best = min(results, key=lambda res: res.score)
+        threshold = global_best.score + global_best.se
+        candidates = [res for res in results if res.score <= threshold]
+
+        def regularization_key(res):
+            nbreak_val = res.max_nbreak if res.max_nbreak is not None \
+                    else np.inf
+            wavelet_rank = 0 if res.wavelet == 'db8' else \
+                    pw.Wavelet(res.wavelet).dec_len
+            return (-res.sfac, nbreak_val, res.k != 3, wavelet_rank)
+        best = min(candidates, key=regularization_key)
+
+        self.photoshop_results = results
+        self.photoshop_best = best
+
+        if not quiet:
+            print("photoshop_spline_model: selected wavelet=%s, k=%d, sfac=%.4g, max_nbreak=%s (CV reduced chi2 = %.4f +/- %.4f; global minimum was %.4f +/- %.4f)." % (
+                    best.wavelet, best.k, best.sfac, str(best.max_nbreak),
+                    best.score, best.se, global_best.score, global_best.se))
+
+        if apply:
+            self.make_spline_model(max_ncomp=max_ncomp, smooth=True,
+                    snr_cutoff=snr_cutoff, rchi2_tol=rchi2_tol, k=best.k,
+                    sfac=best.sfac, max_nbreak=best.max_nbreak,
+                    wavelet=best.wavelet, model_name=model_name,
+                    quiet=quiet, **kwargs)
+
+        return best.wavelet, best.k, best.sfac, best.max_nbreak
+
 
 if __name__ == "__main__":
 
@@ -342,6 +575,25 @@ if __name__ == "__main__":
                       action="store", metavar="max_knots", dest="max_nbreak",
                       default=None,
                       help="The maximum number of unique knots.  This functions esentially as an ignorant smoothing condition in case the default settings return a fit with more than max_knots number of unique knots in the spline model.  e.g., 10 unique knots are more than usually necessary.")
+    parser.add_option("--photoshop",
+                      action="store_true", dest="photoshop", default=False,
+                      help="Auto-select wavelet, k (-k), sfac (-f), and max_nbreak (-t) via cross-validation, instead of using the given/default values for those options.  Implies -s.")
+    parser.add_option("--photoshop-wavelets",
+                      action="store", metavar="wavelets", dest="photoshop_wavelets",
+                      default="db4,db8,db12,db20,sym8,sym12,coif4",
+                      help="Comma-separated list of candidate wavelets to try with --photoshop. [default=db4,db8,db12,db20,sym8,sym12,coif4].")
+    parser.add_option("--photoshop-repeats",
+                      action="store", metavar="nrepeat", dest="photoshop_repeats",
+                      default=20,
+                      help="Number of random train/test splits per wavelet used by --photoshop. [default=20].")
+    parser.add_option("--photoshop-testfrac",
+                      action="store", metavar="test_frac", dest="photoshop_testfrac",
+                      default=0.2,
+                      help="Fraction of channels held out per split used by --photoshop. [default=0.2].")
+    parser.add_option("--photoshop-seed",
+                      action="store", metavar="seed", dest="photoshop_seed",
+                      default=None,
+                      help="Random seed for --photoshop, for reproducibility. [default=None].")
     parser.add_option("--plots",
                       action="store_true", dest="make_plots", default=False,
                       help="Save some plots related to the model with basename model_name (-l).")
@@ -372,6 +624,14 @@ if __name__ == "__main__":
         max_nbreak = int(options.max_nbreak)
     else:
         max_nbreak = None
+    photoshop = options.photoshop
+    photoshop_wavelets = tuple(options.photoshop_wavelets.split(","))
+    photoshop_repeats = int(options.photoshop_repeats)
+    photoshop_testfrac = float(options.photoshop_testfrac)
+    if options.photoshop_seed is not None:
+        photoshop_seed = int(options.photoshop_seed)
+    else:
+        photoshop_seed = None
     make_plots = options.make_plots
     quiet = options.quiet
 
@@ -380,9 +640,17 @@ if __name__ == "__main__":
     if norm in ("mean", "max", "prof", "rms", "abs"):
         dp.normalize_portrait(norm)
 
-    dp.make_spline_model(max_ncomp=max_ncomp, smooth=smooth,
-                         snr_cutoff=snr_cutoff, rchi2_tol=rchi2_tol, k=k, sfac=sfac,
-                         max_nbreak=max_nbreak, model_name=model_name, quiet=quiet)
+    if photoshop:
+        if not quiet:
+            print("--photoshop given; -k/-f/-t (if given) are ignored in favor of cross-validated values.")
+        dp.photoshop_spline_model(max_ncomp=max_ncomp, snr_cutoff=snr_cutoff,
+                rchi2_tol=rchi2_tol, wavelets=photoshop_wavelets,
+                test_frac=photoshop_testfrac, nrepeat=photoshop_repeats,
+                seed=photoshop_seed, model_name=model_name, quiet=quiet)
+    else:
+        dp.make_spline_model(max_ncomp=max_ncomp, smooth=smooth,
+                             snr_cutoff=snr_cutoff, rchi2_tol=rchi2_tol, k=k, sfac=sfac,
+                             max_nbreak=max_nbreak, model_name=model_name, quiet=quiet)
 
     if modelfile is None: modelfile = datafile + ".spl"
     dp.write_model(modelfile, quiet=quiet)

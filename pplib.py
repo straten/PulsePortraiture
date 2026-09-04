@@ -1773,7 +1773,7 @@ def smart_smooth(port, try_nlevels=None, rchi2_tol=0.1, **kwargs):
         try_nlevels = int(np.log2(port.shape[-1]))
     smooth_port = np.zeros(port.shape)
     if 'wavelet' in kwargs:
-        wavelet = kwargs['wave']
+        wavelet = kwargs['wavelet']
     else:
         wavelet = 'db8'
     if 'nlevel' in kwargs: kwargs.pop('nlevel')
