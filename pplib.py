@@ -1801,39 +1801,90 @@ def smart_smooth(port, try_nlevels=None, rchi2_tol=0.1, **kwargs):
         threshtype = 'hard'
     if 'fact' in kwargs: kwargs.pop('fact')
     for iprof, prof in enumerate(port):
-        if not np.any(prof): continue
-        # Compute the SWT decomposition once, at the deepest level that
-        # will be tried; pw.swt(prof, wavelet, level=L) computes levels
-        # 1..L as a cascade, so full_coeffs[try_nlevels-nlevel:] is exactly
-        # the (nlevel x 2 x nbin) array pw.swt(prof, wavelet, level=nlevel)
-        # would have returned on its own, without recomputing it.  Since
-        # fact does not affect the decomposition (only the thresholding
-        # that follows it), this avoids redoing the expensive SWT/ISWT
-        # transform on every one of the Ns grid points below, for every
-        # candidate level.
-        full_coeffs = np.array(pw.swt(prof, wavelet, level=try_nlevels,
-                                      start_level=0, axis=-1))
-        fun_vals = np.zeros([try_nlevels])
-        fact_mins = np.zeros([try_nlevels])
-        for ilevel in range(try_nlevels):
-            nlevel = ilevel + 1
-            coeffs = full_coeffs[try_nlevels - nlevel:]
-            other_args = (coeffs, wavelet, nbin, threshtype, rchi2_tol, prof)
-            results = opt.brute(_fit_wavelet_smooth_function_from_swt,
-                                ranges=[tuple((0.0, 3.0))], args=other_args, Ns=30,
-                                full_output=True)
-            fact_mins[ilevel] = results[0][0]
-            fun_vals[ilevel] = results[1]
-        ilevel_min = fun_vals.argmin()
-        fact_min = fact_mins[ilevel_min]
-        smooth_port[iprof] = wavelet_smooth(prof, wavelet=wavelet,
-                                            nlevel=ilevel_min + 1, threshtype=threshtype, fact=fact_min)
-        red_chi2 = get_red_chi2(prof, smooth_port[iprof])
-        if abs(red_chi2 - 1.0) > rchi2_tol: smooth_port[iprof] *= 0.0
+        smooth_port[iprof], score, ilevel_min, fact_min = _smart_smooth_profile(
+                prof, wavelet, rchi2_tol, try_nlevels=try_nlevels,
+                threshtype=threshtype)
     if one_prof:
         return smooth_port[0]
     else:
         return smooth_port
+
+
+def _default_try_nlevels(nbin):
+    """
+    The try_nlevels smart_smooth(...) derives for a profile of length nbin
+        when no try_nlevels override is given: 0 if nbin is odd (no
+        smoothing possible), 1 if nbin is not a power of two, else
+        int(log2(nbin)).  See smart_smooth(...) for details; factored out so
+        callers that use _smart_smooth_profile(...) directly (which, unlike
+        smart_smooth(...), requires try_nlevels explicitly) can derive the
+        same default.
+    """
+    if nbin % 2 != 0:
+        return 0
+    elif np.modf(np.log2(nbin))[0] != 0.0:
+        return 1
+    else:
+        return int(np.log2(nbin))
+
+
+def _smart_smooth_profile(prof, wavelet, rchi2_tol, try_nlevels,
+                          threshtype='hard'):
+    """
+    Find the best-fit smooth version of a single profile via
+        wavelet_smooth(...), searching over decomposition level and
+        threshold factor; this is smart_smooth(...)'s per-profile step,
+        factored out so it can also be used to score a candidate wavelet
+        on its own (see e.g. photoshop_spline_model(...) in ppspline.py).
+
+    Returns (smooth_prof, score, ilevel_min, fact_min).  smooth_prof is an
+        all-zero array, and score is 0.0, if prof is all zero or if no
+        (level, fact) trial kept the reduced chi-squared within rchi2_tol of
+        1.0 (matching smart_smooth(...)'s behavior).  score is otherwise the
+        pseudo-S/N (see fit_wavelet_smooth_function(...)) achieved at the
+        chosen (level, fact) -- higher means the wavelet more effectively
+        separated signal from noise for this profile, at this rchi2_tol.
+
+    try_nlevels is the maximum decomposition level to try (unlike
+        smart_smooth(...), this is not optional/auto-derived here).
+    wavelet, rchi2_tol, threshtype are as in smart_smooth(...).
+    """
+    nbin = len(prof)
+    if try_nlevels == 0 or not np.any(prof):
+        return np.zeros(nbin), 0.0, None, None
+    # Compute the SWT decomposition once, at the deepest level that will be
+    # tried; pw.swt(prof, wavelet, level=L) computes levels 1..L as a
+    # cascade, so full_coeffs[try_nlevels-nlevel:] is exactly the
+    # (nlevel x 2 x nbin) array pw.swt(prof, wavelet, level=nlevel) would
+    # have returned on its own, without recomputing it.  Since fact does
+    # not affect the decomposition (only the thresholding that follows it),
+    # this avoids redoing the expensive SWT/ISWT transform on every one of
+    # the Ns grid points below, for every candidate level.
+    full_coeffs = np.array(pw.swt(prof, wavelet, level=try_nlevels,
+                                  start_level=0, axis=-1))
+    fun_vals = np.zeros([try_nlevels])
+    fact_mins = np.zeros([try_nlevels])
+    for ilevel in range(try_nlevels):
+        nlevel = ilevel + 1
+        coeffs = full_coeffs[try_nlevels - nlevel:]
+        other_args = (coeffs, wavelet, nbin, threshtype, rchi2_tol, prof)
+        results = opt.brute(_fit_wavelet_smooth_function_from_swt,
+                            ranges=[tuple((0.0, 3.0))], args=other_args, Ns=30,
+                            full_output=True)
+        fact_mins[ilevel] = results[0][0]
+        fun_vals[ilevel] = results[1]
+    ilevel_min = fun_vals.argmin()
+    fact_min = fact_mins[ilevel_min]
+    nlevel_min = ilevel_min + 1
+    coeffs = full_coeffs[try_nlevels - nlevel_min:]
+    smooth_prof = _wavelet_denoise_from_swt(coeffs, wavelet, nbin,
+                                            threshtype, fact_min)
+    score = -fun_vals[ilevel_min]
+    red_chi2 = get_red_chi2(prof, smooth_prof)
+    if abs(red_chi2 - 1.0) > rchi2_tol:
+        smooth_prof = smooth_prof * 0.0
+        score = 0.0
+    return smooth_prof, score, ilevel_min, fact_min
 
 
 def fit_wavelet_smooth_function(fact, prof, wavelet, nlevel, threshtype,

@@ -26,6 +26,7 @@ from __future__ import print_function
 
 from past.utils import old_div
 from pplib import *
+from pplib import _smart_smooth_profile, _default_try_nlevels
 
 
 def _fit_pca_and_smooth(port, freqs, pca_weights, max_ncomp, smooth,
@@ -346,39 +347,141 @@ class DataPortrait(DataPortrait):
                                           self.freqsxs[0], old_div(self.SNRsxs, np.sum(self.SNRsxs)),
                                           ncoord=ncomp, title=title, **kwargs)
 
+    def select_wavelet(self, wavelets=('db4', 'db8', 'db12', 'db20', 'sym8',
+                                       'sym12', 'coif4'), rchi2_tol=0.1,
+                       quiet=False):
+        """
+        Pick the wavelet that best denoises the (full-dataset) mean profile.
+
+        For each candidate wavelet, the mean profile (as used by
+            make_spline_model(...)) is put through the same per-profile
+            search smart_smooth(...) uses (decomposition level and
+            threshold factor chosen to maximize a pseudo-S/N subject to
+            keeping the reduced chi-squared within rchi2_tol of 1.0).  Among
+            the wavelets that satisfy that constraint, the one selected is
+            the one whose *residual* (mean profile minus smoothed profile)
+            looks most like unstructured white noise: whatever a genuinely
+            clean denoising fails to capture in the smooth curve should be
+            indistinguishable from noise, not leftover correlated structure
+            (the wavelet under-resolved a real feature) or ringing (a
+            reconstruction artefact).  This is quantified by how close the
+            residual's zero-crossing rate (see pplib.count_crossings(...))
+            is to the 0.5 expected for symmetric white noise -- too FEW
+            crossings means real structure was left behind; too MANY is
+            atypical of pure noise and can catch some kinds of artefacts.
+
+            An earlier version of this method ranked wavelets by the same
+            pseudo-S/N used to pick level/factor within a single wavelet.
+            That turned out to scale with a wavelet's filter length almost
+            independent of how well it actually denoises -- longer-support
+            wavelets structurally leave less high-frequency content in the
+            reconstruction, which inflates that ratio without reflecting
+            better denoising -- so it could not fairly rank different
+            wavelet families against each other, and is not used here.
+
+        Returns (best_wavelet, info), where info is a
+            {wavelet: DataBunch(snr, residual_crossing_frac)} dict for every
+            candidate (snr is the pseudo-S/N noted above, kept only for
+            inspection; residual_crossing_frac is None for any wavelet that
+            could not keep the reduced chi-squared within tolerance at any
+            decomposition level, and such wavelets are never selected).
+            Falls back to 'db8' (or wavelets[0], if 'db8' is not a
+            candidate) if every wavelet fails that way.
+
+        wavelets is the list of candidate mother wavelets to try.
+        rchi2_tol is as in make_spline_model(...).
+        quiet=True suppresses output.
+        """
+        if 'pywt' not in sys.modules:
+            raise ImportError("You failed to import pywt and need PyWavelets to use select_wavelet!")
+
+        port = self.portx
+        pca_weights = old_div(self.SNRsxs, np.sum(self.SNRsxs))
+        mean_prof = old_div((port.T * pca_weights).T.sum(axis=0),
+                            pca_weights.sum())
+        nbin = port.shape[1]
+        try_nlevels = _default_try_nlevels(nbin)
+
+        info = {}
+        for w in wavelets:
+            smooth_prof, snr, unused_ilevel, unused_fact = \
+                    _smart_smooth_profile(mean_prof, w, rchi2_tol,
+                            try_nlevels)
+            if snr > 0.0:
+                residual = mean_prof - smooth_prof
+                crossing_frac = old_div(count_crossings(residual, 0.0),
+                                        float(nbin - 1))
+            else:
+                crossing_frac = None
+            info[w] = DataBunch(snr=snr, residual_crossing_frac=crossing_frac)
+            if not quiet:
+                if crossing_frac is None:
+                    print("select_wavelet: wavelet '%s' could not keep the mean profile's reduced chi2 within tolerance at any level." % w)
+                else:
+                    print("select_wavelet: wavelet '%s' residual zero-crossing fraction = %.4f (0.5 = ideal white-noise residual)." % (
+                            w, crossing_frac))
+
+        valid = [w for w in wavelets if info[w].residual_crossing_frac is not None]
+        if not valid:
+            best_wavelet = 'db8' if 'db8' in wavelets else wavelets[0]
+            if not quiet:
+                print("select_wavelet: no candidate wavelet kept the mean profile's reduced chi2 within tolerance; falling back to '%s'." % best_wavelet)
+        else:
+            best_wavelet = min(valid,
+                    key=lambda w: abs(info[w].residual_crossing_frac - 0.5))
+            if not quiet:
+                print("select_wavelet: selected wavelet '%s' (residual zero-crossing fraction = %.4f)." % (
+                        best_wavelet, info[best_wavelet].residual_crossing_frac))
+        return best_wavelet, info
+
     def photoshop_spline_model(self, max_ncomp=10, snr_cutoff=150.0,
                                rchi2_tol=0.1,
                                wavelets=('db4', 'db8', 'db12', 'db20', 'sym8',
                                          'sym12', 'coif4'),
                                ks=(1, 3, 5), max_nbreak_candidates=(None,),
                                test_frac=0.2, nrepeat=20, sfac_bounds=(-3, 2),
-                               seed=None, apply=True, model_name=None,
-                               quiet=False, **kwargs):
+                               decouple_wavelet=True, seed=None, apply=True,
+                               model_name=None, quiet=False, **kwargs):
         """
         Auto-select (wavelet, k, sfac, max_nbreak) for make_spline_model(...)
             via Monte Carlo cross-validation over frequency channels.
 
-        For each candidate wavelet, nrepeat random train/test splits of the
-            (non-edge) frequency channels are drawn.  For each split, PCA and
-            eigenprofile/mean-profile smoothing are fit on the training
-            channels only -- this is the expensive step, and is independent
-            of k, sfac, and max_nbreak, so it is done once per (wavelet,
-            split) and reused.  Then, for each (k, max_nbreak) combination,
-            sfac is optimized (on a log scale) to minimize the out-of-sample
-            reduced chi-squared of the B-spline curve evaluated on the
-            held-out channels.  The standard error of that score across the
-            nrepeat splits is used to apply a "1-SE rule": among
-            (wavelet, k, max_nbreak, sfac) combinations statistically
-            indistinguishable from the minimum-scoring one, the most
-            regularized (largest sfac, then smallest max_nbreak, then k == 3,
-            then wavelet == 'db8') is selected.
+        If decouple_wavelet=True (default), a single wavelet is first chosen
+            by select_wavelet(...) -- how well it denoises the full-dataset
+            mean profile, independent of k/sfac/max_nbreak -- and only that
+            wavelet is used below.  This turns the search from
+            len(wavelets)*nrepeat expensive PCA/eigenprofile fits into
+            roughly len(wavelets) cheap single-profile fits (select_wavelet)
+            plus nrepeat expensive fits (for the one chosen wavelet), at the
+            cost of assuming the wavelet that best smooths the mean profile
+            also serves the (lower-S/N) eigenprofiles well.  With
+            decouple_wavelet=False, wavelet is instead cross-validated
+            jointly with k/sfac/max_nbreak below (len(wavelets)*nrepeat
+            expensive fits), as in earlier versions of this method.
+
+        For each candidate wavelet (only one, if decouple_wavelet=True),
+            nrepeat random train/test splits of the (non-edge) frequency
+            channels are drawn.  For each split, PCA and eigenprofile/mean-
+            profile smoothing are fit on the training channels only -- this
+            is the expensive step, and is independent of k, sfac, and
+            max_nbreak, so it is done once per (wavelet, split) and reused.
+            Then, for each (k, max_nbreak) combination, sfac is optimized
+            (on a log scale) to minimize the out-of-sample reduced
+            chi-squared of the B-spline curve evaluated on the held-out
+            channels.  The standard error of that score across the nrepeat
+            splits is used to apply a "1-SE rule": among (wavelet, k,
+            max_nbreak, sfac) combinations statistically indistinguishable
+            from the minimum-scoring one, the most regularized (largest
+            sfac, then smallest max_nbreak, then k == 3, then
+            wavelet == 'db8') is selected.
 
         If apply=True (default), make_spline_model(...) is then called on the
             full dataset using the selected hyperparameters, exactly as if
             they had been supplied by hand.  self.photoshop_results holds the
             full grid of (wavelet, k, max_nbreak, sfac, score, se) that was
             evaluated, for inspection; self.photoshop_best holds the
-            selected entry.
+            selected entry; self.photoshop_wavelet_scores holds the
+            select_wavelet(...) scores, if decouple_wavelet=True.
 
         max_ncomp, snr_cutoff, rchi2_tol are as in make_spline_model(...) and
             are held fixed here (not tuned).
@@ -393,6 +496,7 @@ class DataPortrait(DataPortrait):
         nrepeat is the number of random train/test splits per wavelet.
         sfac_bounds are the (log10(sfac_min), log10(sfac_max)) search bounds
             passed to the underlying opt.brute search over sfac.
+        decouple_wavelet is described above.
         seed seeds the random number generator, for reproducibility.
         apply=True fits and stores the final model using the chosen
             hyperparameters; apply=False only computes/stores the search
@@ -412,6 +516,14 @@ class DataPortrait(DataPortrait):
         nchanx, nbin = port.shape
         rng = np.random.RandomState(seed)
 
+        if decouple_wavelet:
+            chosen_wavelet, wavelet_scores = self.select_wavelet(
+                    wavelets=wavelets, rchi2_tol=rchi2_tol, quiet=quiet)
+            self.photoshop_wavelet_scores = wavelet_scores
+            search_wavelets = (chosen_wavelet,)
+        else:
+            search_wavelets = wavelets
+
         # Never hold out the band-edge channels -- doing so would shrink the
         # training fit's ub/ue boundary and force gen_spline_portrait to
         # extrapolate for that channel, confounding "bad hyperparameter" with
@@ -423,7 +535,7 @@ class DataPortrait(DataPortrait):
         # Expensive stage: PCA + smoothing, once per (wavelet, repeat);
         # reused below across all (k, max_nbreak, sfac) combinations.
         stash = {}
-        for w in wavelets:
+        for w in search_wavelets:
             if not quiet:
                 print("photoshop_spline_model: fitting %d train/test splits for wavelet '%s'..." % (nrepeat, w))
             for r in range(nrepeat):
@@ -450,7 +562,7 @@ class DataPortrait(DataPortrait):
 
         # Cheap stage: optimize sfac (log10) per (wavelet, k, max_nbreak).
         results = []
-        for w in wavelets:
+        for w in search_wavelets:
             for k in ks:
                 for max_nbreak in max_nbreak_candidates:
 
