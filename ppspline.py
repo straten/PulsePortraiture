@@ -117,14 +117,15 @@ def _fit_spline_curve(proj_port, freqs, spl_weights, noise_stds, k, sfac,
             quiet=int(quiet))
     if max_nbreak is not None and len(np.unique(tck[0])) > max_nbreak:
         if max_nbreak < 2:
-            print("max_nbreak not >= 2; setting max_nbreak = 2...")
+            if not quiet:
+                print("max_nbreak not >= 2; setting max_nbreak = 2...")
             max_nbreak = 2
         if max_nbreak == 2: s = np.inf
         (tck,u), fp, ier, msg = si.splprep(proj_port[::flip].T,
                 w=spl_weights[::flip], u=freqs[::flip], ub=nu_lo,
                 ue=nu_hi, k=k, task=0, s=s, t=None, full_output=1,
                 nest=max_nbreak+(k*2), per=0, quiet=int(quiet))
-    if ier > 1: #Will also catch when ier == "unknown"
+    if ier > 1 and not quiet: #Will also catch when ier == "unknown"
         print("Something went wrong in si.splprep:\n%s" % msg)
     return tck, u, fp, ier, msg
 
